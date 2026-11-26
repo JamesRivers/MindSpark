@@ -141,13 +141,18 @@ function sendHtml(res, status, html) {
 // provider's response unchanged.
 //
 // The key is read from the request, used for exactly one upstream request, and
-// never stored, logged, or attached to any error. Only the two chat-completion
-// paths the app uses are allowed; this is not an open relay.
+// never stored, logged, or attached to any error. Only the routes the app uses
+// are allowed; this is not an open relay.
 // ---------------------------------------------------------------------------
-const OPENCODE_UPSTREAM = (process.env.OPENCODE_UPSTREAM || 'https://opencode.ai/inference').replace(/\/+$/, '');
-const OPENCODE_PATHS = new Set([
-  'openai/v1/chat/completions',
-  'go/openai/v1/chat/completions'
+const OPENCODE_INFERENCE = (process.env.OPENCODE_UPSTREAM || 'https://opencode.ai/inference').replace(/\/+$/, '');
+// rest path -> { url, method, publicFallback? }. Model lists come from the
+// inference endpoints: public without a key, narrowed to the key's workspace
+// with one. A rejected key retries without it so the picker still populates.
+const OPENCODE_ROUTES = new Map([
+  ['openai/v1/chat/completions', { url: OPENCODE_INFERENCE + '/openai/v1/chat/completions', method: 'POST' }],
+  ['go/openai/v1/chat/completions', { url: OPENCODE_INFERENCE + '/go/openai/v1/chat/completions', method: 'POST' }],
+  ['models', { url: OPENCODE_INFERENCE + '/v1/models', method: 'GET', publicFallback: true }],
+  ['go/models', { url: OPENCODE_INFERENCE + '/go/v1/models', method: 'GET', publicFallback: true }]
 ]);
 const MAX_LLM_BODY = 2 * 1024 * 1024;
 
@@ -174,7 +179,8 @@ function readBodyLimited(req, limit) {
 async function opencodeProxy(req, res, pathname) {
   const prefix = '/api/llm/opencode/';
   const rest = pathname.slice(prefix.length);
-  if (!OPENCODE_PATHS.has(rest)) return sendJson(res, 404, { error: { message: 'unknown upstream path' } });
+  const route = OPENCODE_ROUTES.get(rest);
+  if (!route) return sendJson(res, 404, { error: { message: 'unknown upstream path' } });
 
   // Same-origin only. A browser sends Origin on cross-origin requests; refusing
   // another site's origin keeps this from becoming a free relay for its keys.
@@ -182,39 +188,53 @@ async function opencodeProxy(req, res, pathname) {
   if (origin && origin !== appOrigin(req)) return sendJson(res, 403, { error: { message: 'origin not allowed' } });
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'authorization, content-type' });
+    res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'authorization, content-type' });
     return res.end();
   }
-  if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'method not allowed' } });
+  if (req.method !== route.method) return sendJson(res, 405, { error: { message: 'method not allowed' } });
 
   const auth = req.headers.authorization || '';
-  if (!/^Bearer\s+\S+/i.test(auth)) return sendJson(res, 401, { error: { message: 'OpenCode API key required' } });
-  if (Number(req.headers['content-length'] || 0) > MAX_LLM_BODY) return sendJson(res, 413, { error: { message: 'request body too large' } });
+  const hasAuth = /^Bearer\s+\S+/i.test(auth);
+  // Chat always needs the caller's key. Model lists work without one (Console
+  // falls back to the public catalog), so the picker can populate before a key
+  // is pasted.
+  if (route.method === 'POST' && !hasAuth) return sendJson(res, 401, { error: { message: 'OpenCode API key required' } });
 
   let body;
-  try { body = await readBodyLimited(req, MAX_LLM_BODY); }
-  catch (e) { return sendJson(res, e.status || 400, { error: { message: e.message } }); }
+  if (route.method === 'POST') {
+    if (Number(req.headers['content-length'] || 0) > MAX_LLM_BODY) return sendJson(res, 413, { error: { message: 'request body too large' } });
+    try { body = await readBodyLimited(req, MAX_LLM_BODY); }
+    catch (e) { return sendJson(res, e.status || 400, { error: { message: e.message } }); }
+  }
 
   const headers = {
-    'Content-Type': 'application/json',
     'Accept': 'application/json',
-    'Authorization': auth,
     'User-Agent': 'MindSpark-selfhost/1.0'
   };
+  if (hasAuth) headers['Authorization'] = auth;
+  if (route.method === 'POST') headers['Content-Type'] = 'application/json';
   // OpenCode Go asks clients for a stable session id. Forward one if a future
   // client sends it; otherwise this stays absent rather than inventing a new
   // "session" on every request.
   const session = req.headers['x-opencode-session'];
   if (session) headers['x-opencode-session'] = String(session);
 
-  let upstream;
+  const call = (url, hdrs) => fetch(url, {
+    method: route.method,
+    headers: hdrs || headers,
+    body,
+    signal: AbortSignal.timeout(120000)
+  });
+
+  let upstream, usedFallback = false;
   try {
-    upstream = await fetch(OPENCODE_UPSTREAM + '/' + rest, {
-      method: 'POST',
-      headers,
-      body,
-      signal: AbortSignal.timeout(120000)
-    });
+    upstream = await call(route.url);
+    if (route.publicFallback && hasAuth && (upstream.status === 401 || upstream.status === 403)) {
+      const anon = { ...headers };
+      delete anon['Authorization'];
+      const fb = await call(route.url, anon);
+      if (fb.ok) { upstream = fb; usedFallback = true; }
+    }
   } catch (e) {
     const timedOut = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
     return sendJson(res, 502, { error: { message: timedOut ? 'OpenCode timed out' : 'OpenCode unreachable' } });
@@ -222,11 +242,15 @@ async function opencodeProxy(req, res, pathname) {
 
   const text = await upstream.text();
   const type = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
-  res.writeHead(upstream.status, {
+  const out = {
     'Content-Type': type,
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(text)
-  });
+  };
+  if (route.method === 'GET' && rest.endsWith('models')) {
+    out['X-MindSpark-Models-Source'] = (usedFallback || !hasAuth) ? 'public' : 'account';
+  }
+  res.writeHead(upstream.status, out);
   res.end(text);
 }
 

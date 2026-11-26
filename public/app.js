@@ -8980,6 +8980,70 @@ function llmModelFor(pv){
   if(m && cfg.retiredModel && cfg.retiredModel.test(m)) m='';
   return m || cfg.defaultModel;
 }
+// ---- OpenCode model picker ------------------------------------------------
+// OpenCode is the only provider with a live model catalogue this app can read
+// (the others either have no public list or one behind a different key). Fetch
+// it through the same-origin proxy, cache it, and fall back to a short list if
+// the account/key cannot read its own catalogue. Free-tier models are dropped:
+// opencode.ai only serves them inside OpenCode, so choosing one here would
+// produce a 403 after the user had typed a prompt.
+const OPENCODE_MODEL_FALLBACK = [
+  { id:'glm-5.3',             name:'GLM-5.3' },
+  { id:'glm-5.3-flash',       name:'GLM-5.3-Flash' },
+  { id:'kimi-k3',             name:'Kimi K3' },
+  { id:'deepseek-v4.1-flash', name:'DeepSeek V4.1 Flash' },
+  { id:'minimax-m3',          name:'MiniMax-M3' },
+  { id:'claude-haiku-5-5',    name:'Claude Haiku 5.5' }
+];
+const OPENCODE_MODELS_TTL = 12*60*60*1000;
+function isOpencodeProvider(pv){ return pv==='opencode' || pv==='opencode-go'; }
+function opencodeModelsUrl(pv){
+  const proxy=(typeof window!=='undefined' && window.MINDSPARK_CONFIG && typeof window.MINDSPARK_CONFIG.llmProxy==='string' && window.MINDSPARK_CONFIG.llmProxy.trim())
+    ? window.MINDSPARK_CONFIG.llmProxy.trim().replace(/\/+$/,'') : '';
+  const go=pv==='opencode-go';
+  return proxy ? proxy+(go?'/go/models':'/models')
+               : 'https://opencode.ai/inference'+(go?'/go/v1/models':'/v1/models');
+}
+function opencodeModelsCacheKey(pv){ return 'mindspark:llm:models:'+pv; }
+async function fetchOpencodeModels(pv, key, opts){
+  opts=opts||{};
+  const cacheKey=opencodeModelsCacheKey(pv);
+  if(!opts.force){
+    try{
+      const c=JSON.parse(localStorage.getItem(cacheKey)||'null');
+      if(c && Array.isArray(c.models) && c.models.length && Date.now()-(c.ts||0)<OPENCODE_MODELS_TTL) return c;
+    }catch(e){}
+  }
+  const headers={};
+  if(key) headers.Authorization='Bearer '+key;
+  const r=await fetch(opencodeModelsUrl(pv),{headers,cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const j=await r.json();
+  let raw=[];
+  if(Array.isArray(j.data)) raw=j.data;                       // inference list shape
+  else if(Array.isArray(j.models)) raw=j.models;
+  else if(j && typeof j==='object'){
+    // Console list shape: { opencode: { models: { id: {...} } }, ... }
+    const want=pv==='opencode-go' ? j['opencode-go'] : j.opencode;
+    if(want && want.models && typeof want.models==='object') raw=Object.values(want.models);
+    else if(pv==='opencode' && j['opencode-go']) throw new Error('this key has Go models only - switch to OpenCode Go');
+  }
+  const models=raw
+    .filter(m=>m && typeof m.id==='string' && m.id && (!m.type || m.type==='chat'))
+    // Free models only run inside OpenCode; keep them out of the picker.
+    .filter(m=>!/-free$/i.test(m.id))
+    .filter(m=>{
+      const c=m.cost && m.cost.text; if(!c) return true;
+      const i=c.input && c.input.price, o=c.output && c.output.price;
+      return !(i===0 && (o===0 || o===undefined));
+    })
+    .map(m=>({ id:m.id, name:(typeof m.name==='string' && m.name.trim()) || m.id }))
+    .sort((a,b)=>a.name.localeCompare(b.name));
+  if(!models.length) throw new Error('no models returned');
+  const out={ ts:Date.now(), models, source:r.headers.get('x-mindspark-models-source')||'account' };
+  try{ localStorage.setItem(cacheKey, JSON.stringify(out)); }catch(e){}
+  return out;
+}
 // A saved preset is {label, task}: the label is what the chip shows, the task
 // is the instruction. Earlier builds stored bare instruction strings and
 // showed their first 24 characters; those still load, with that same derived
@@ -9279,7 +9343,9 @@ function showAiMapPanel(){
           ${Object.entries(PROVS).map(([k,v])=>`<option value="${escapeHtml(k)}"${k===provider?' selected':''}>${escapeHtml(v.label)}</option>`).join('')}
         </select>
         <input class="bp-model" placeholder="model" aria-label="Model name" value="${escapeHtml(model)}">
+        <select class="bp-model-select" style="display:none" aria-label="Model"></select>
       </div>
+      <div class="bp-model-status bp-warn" style="margin:-4px 0 8px"></div>
       <input class="bp-key" type="password" placeholder="API key (stored only in this browser)" aria-label="API key" value="${escapeHtml(localStorage.getItem('mindspark:llm:key:'+provider)||'')}">
       <div class="bp-warn">✦ BYOK: your key stays in this browser and is sent directly to the provider you pick. Use a scoped key; don't do this on a shared machine. The map itself is saved to your GitHub maps repository.</div>
       <div class="bp-run-row">
@@ -9291,7 +9357,9 @@ function showAiMapPanel(){
   document.body.appendChild(panel);
   panel.addEventListener('mousedown',e=>e.stopPropagation());
   const $$=s=>panel.querySelector(s);
-  const ta=$$('.bp-text'), provSel=$$('.bp-provider'), modelIn=$$('.bp-model'), keyIn=$$('.bp-key');
+  const ta=$$('.bp-text'), provSel=$$('.bp-provider'), modelIn=$$('.bp-model'), modelSel=$$('.bp-model-select'),
+        modelStatus=$$('.bp-model-status'), keyIn=$$('.bp-key');
+  let modelReq=0;
   const closePanel=()=>{ panel.remove();
     if(_prevFocus && _prevFocus.focus && document.contains(_prevFocus)) _prevFocus.focus(); };
   $$('.bp-x').onclick=closePanel;
@@ -9302,20 +9370,68 @@ function showAiMapPanel(){
   panel.focus();
 
   const keyHint=()=>{ const cfg=llmProviders()[provSel.value]; keyIn.placeholder=(cfg && !cfg.needsKey) ? 'No key needed for this provider (optional)' : 'API key (stored only in this browser)'; };
+  const rememberModel=(pv,m)=>{ try{ localStorage.setItem('mindspark:llm:model:'+pv,m); }catch(e){} };
+  const modelStatusText=(text, withRefresh)=>{
+    modelStatus.textContent=text;
+    if(withRefresh){
+      modelStatus.appendChild(document.createTextNode(' '));
+      const b=document.createElement('button');
+      b.type='button'; b.textContent='Refresh';
+      b.style.cssText='border:0;background:none;color:var(--accent);cursor:pointer;padding:0;font:inherit;text-decoration:underline';
+      b.onclick=()=>{ refreshModels(true); };
+      modelStatus.appendChild(b);
+    }
+  };
+  async function refreshModels(force){
+    const req=++modelReq, pv=provSel.value;
+    if(!isOpencodeProvider(pv)){
+      modelIn.style.display=''; modelSel.style.display='none';
+      modelStatus.textContent=''; modelIn.value=llmModelFor(pv);
+      return;
+    }
+    modelIn.style.display='none'; modelSel.style.display='';
+    const key=keyIn.value.trim();
+    modelStatusText('Loading models…', false);
+    let data=null, err='';
+    try{ data=await fetchOpencodeModels(pv,key,{force}); }
+    catch(e){
+      err=e.message;
+      try{ const c=JSON.parse(localStorage.getItem(opencodeModelsCacheKey(pv))||'null'); if(c&&Array.isArray(c.models)&&c.models.length) data=c; }catch(e2){}
+    }
+    if(req!==modelReq) return;                 // provider/key changed while loading
+    const list=(data&&Array.isArray(data.models)&&data.models.length)?data.models:OPENCODE_MODEL_FALLBACK;
+    const current=llmModelFor(pv);
+    modelSel.innerHTML=list.map(m=>`<option value="${escapeHtml(m.id)}">${escapeHtml(m.name)}${m.name!==m.id?' ('+escapeHtml(m.id)+')':''}</option>`).join('');
+    const has=list.some(m=>m.id===current);
+    modelSel.value=has?current:list[0].id;
+    if(!has) rememberModel(pv, modelSel.value);
+    let note;
+    if(err) note=`Couldn't list models (${err}) - showing ${data?'saved':'default'} list.`;
+    else if(data && data.source==='public' && pv==='opencode') note='Public catalog (key not verified). If you have a Go subscription, switch to OpenCode Go.';
+    else note=`${list.length} model${list.length===1?'':'s'} available.`;
+    modelStatusText(note, true);
+  }
   provSel.onchange=()=>{ const pv=provSel.value;
     modelIn.value=llmModelFor(pv);
-    keyIn.value=localStorage.getItem('mindspark:llm:key:'+pv)||''; keyHint(); };
+    keyIn.value=localStorage.getItem('mindspark:llm:key:'+pv)||''; keyHint();
+    refreshModels(true); };
+  modelSel.onchange=()=>rememberModel(provSel.value, modelSel.value);
+  // A pasted key is the moment the account-specific catalogue can be read.
+  keyIn.addEventListener('change', ()=>refreshModels(true));
   keyHint();
+  refreshModels(false).catch(e=>console.warn('model list failed:', e.message));
   $$('.bp-forget').onclick=()=>{ const pv=provSel.value;
     localStorage.removeItem('mindspark:llm:key:'+pv); keyIn.value='';
-    toast('Key for '+((llmProviders()[pv]||{}).label||pv)+' removed from this browser'); };
+    toast('Key for '+((llmProviders()[pv]||{}).label||pv)+' removed from this browser');
+    refreshModels(true); };
 
   $$('.bp-send').onclick=async()=>{
     const topic=ta.value.trim();
     if(!topic){ toast('Describe what the map should be about'); ta.focus(); return; }
     const cfg=llmProviders()[provSel.value];
     if(!cfg){ toast('That provider is no longer configured'); return; }
-    const pv=cfg.id, key=keyIn.value.trim(), mdl=modelIn.value.trim()||cfg.defaultModel;
+    const pv=cfg.id, key=keyIn.value.trim();
+    const mdl=(isOpencodeProvider(pv) ? modelSel.value : modelIn.value.trim())||cfg.defaultModel;
     if(cfg.needsKey && !key){ toast('Enter an API key'); keyIn.focus(); return; }
     if(!mdl){ toast('Enter a model name'); modelIn.focus(); return; }
     if(cfg.custom && !cspAllowsInstance(cfg.url)){
@@ -9353,7 +9469,11 @@ function showAiMapPanel(){
       closePanel();
       toast('Created a map with '+added+' topics');
     }catch(e){
-      res.textContent='Error: '+e.message;
+      let msg='Error: '+e.message;
+      if(isOpencodeProvider(pv) && /Model is unavailable/i.test(e.message)){
+        msg+=' — that model is not available for this provider/key. Pick another from the list, or switch between OpenCode (Console) and OpenCode Go to match your plan.';
+      }
+      res.textContent=msg;
     } finally { send.disabled=false; }
   };
   ta.focus();
@@ -16776,6 +16896,7 @@ const PREFS = [
   { key:'mindspark:llm:provider',      kind:'pref',      section:'AI',         label:'Provider',          show:v=>v||'anthropic (default)' },
   { prefix:'mindspark:llm:model:',     kind:'pref',      section:'AI',         label:'Model',             show:(v,k)=>k.slice('mindspark:llm:model:'.length)+': '+v },
   { prefix:'mindspark:llm:key:',       kind:'secret',    section:'AI',         label:'API key' },
+  { prefix:'mindspark:llm:models:',     kind:'cache',     section:'AI',         label:'Cached model lists' },
   { key:'mindspark:llm:task',          kind:'pref',      section:'AI',         label:'Last task',         show:v=>v ? (v.length>60 ? v.slice(0,60)+'…' : v) : '' },
   { key:'mindspark:llm:prompts',       kind:'content',   section:'AI',         label:'Saved task presets', show:v=>{ try{ return bpNormalizePrompts(JSON.parse(v)).map(p=>p.label).join(', '); }catch(e){ return '(unreadable)'; } } },
   { key:'mindspark:llm:providers',     kind:'content',   section:'AI',         label:'Custom providers',   show:v=>{ try{ return JSON.parse(v).map(p=>p.label).join(', '); }catch(e){ return '(unreadable)'; } } },
