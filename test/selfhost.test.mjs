@@ -69,6 +69,7 @@ describe('selfhost server', () => {
     const json = JSON.parse(text.replace(/^window\.MINDSPARK_CONFIG=/, '').replace(/;\s*$/, ''));
     assert.equal(json.defaultRepo, 'acme/mindspark-maps');
     assert.equal(json.collab, false);
+    assert.equal(json.llmProxy, 'https://maps.example.com/api/llm/opencode');
     assert.deepEqual(json.oauth, {
       clientId: 'client-id',
       workerUrl: 'https://maps.example.com',
@@ -98,5 +99,31 @@ describe('selfhost server', () => {
     assert.ok(r.status === 403 || r.status === 404);
     const body = await r.text();
     assert.equal(body.includes('GITHUB_CLIENT_SECRET'), false);
+  });
+
+  test('OpenCode proxy refuses unknown paths and missing keys without contacting upstream', async () => {
+    const unknown = await fetch(`${BASE}/api/llm/opencode/anything`);
+    assert.equal(unknown.status, 404);
+
+    const noKey = await fetch(`${BASE}/api/llm/opencode/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}'
+    });
+    assert.equal(noKey.status, 401);
+    const body = await noKey.text();
+    assert.equal(body.includes('client-secret'), false);
+  });
+
+  test('OpenCode proxy refuses another origin and non-POST methods', async () => {
+    const cross = await fetch(`${BASE}/api/llm/opencode/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'origin': 'https://evil.example', 'authorization': 'Bearer oc_sk_x' },
+      body: '{}'
+    });
+    assert.equal(cross.status, 403);
+
+    const get = await fetch(`${BASE}/api/llm/opencode/openai/v1/chat/completions`);
+    assert.equal(get.status, 405);
   });
 });

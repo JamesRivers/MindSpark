@@ -128,12 +128,14 @@ The **✦** button beside **＋** opens *Create a mind map with AI*:
 
 ### OpenCode
 
-Both OpenCode endpoints are built in:
+Both OpenCode offerings are built in. opencode.ai does **not** send browser CORS
+headers, so the selfhost server exposes a same-origin forwarding endpoint and
+`/config.js` points the provider at it:
 
-| Provider | Endpoint | Use it with |
+| Provider | What the browser calls | Upstream |
 |---|---|---|
-| OpenCode (Console) | `https://opencode.ai/inference/openai/v1/chat/completions` | Pay-as-you-go Console credits |
-| OpenCode Go | `https://opencode.ai/inference/go/openai/v1/chat/completions` | A Go / Go Plus subscription |
+| OpenCode (Console) | `/api/llm/opencode/openai/v1/chat/completions` | `https://opencode.ai/inference/openai/v1/chat/completions` |
+| OpenCode Go | `/api/llm/opencode/go/openai/v1/chat/completions` | `https://opencode.ai/inference/go/openai/v1/chat/completions` |
 
 Create a personal API key at <https://opencode.ai/console> → **Account →
 Personal API keys** (format `oc_sk_...`), then paste it into the ✦ panel and
@@ -141,10 +143,15 @@ type the model id (for example `glm-5.3`, `kimi-k3`, `claude-sonnet-5-5`).
 Free-tier models are only available inside OpenCode itself; use paid credits or
 Go from another client such as MindSpark.
 
+The proxy accepts only those two chat-completion paths, refuses other origins,
+forwards the caller's Bearer key for exactly one request, and never stores or
+logs it. That means for OpenCode the key **does pass through the VM in memory**
+because the browser cannot reach opencode.ai directly. Anthropic, OpenAI,
+OpenRouter and Groq are still called directly from the browser.
+
 The key is stored in that browser's `localStorage` under
-`mindspark:llm:key:<provider>` and sent **directly to the provider** — never to
-the VM. The same key is shared with the existing branch-level
-*Build prompt → Run with API* panel. "Forget key" removes it.
+`mindspark:llm:key:<provider>`. The same key is shared with the existing
+branch-level *Build prompt → Run with API* panel. "Forget key" removes it.
 
 For a custom provider, add its origin to `EXTRA_CONNECT_SRC` in
 `/etc/mindspark/env` and restart (`systemctl restart mindspark`), otherwise the

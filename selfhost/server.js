@@ -133,6 +133,104 @@ function sendHtml(res, status, html) {
 }
 
 // ---------------------------------------------------------------------------
+// OpenCode proxy
+//
+// opencode.ai/inference does not send Access-Control-Allow-Origin, so a browser
+// cannot call it directly (the preflight is 404). This same-origin endpoint
+// forwards the request, including the caller's own Bearer key, and returns the
+// provider's response unchanged.
+//
+// The key is read from the request, used for exactly one upstream request, and
+// never stored, logged, or attached to any error. Only the two chat-completion
+// paths the app uses are allowed; this is not an open relay.
+// ---------------------------------------------------------------------------
+const OPENCODE_UPSTREAM = (process.env.OPENCODE_UPSTREAM || 'https://opencode.ai/inference').replace(/\/+$/, '');
+const OPENCODE_PATHS = new Set([
+  'openai/v1/chat/completions',
+  'go/openai/v1/chat/completions'
+]);
+const MAX_LLM_BODY = 2 * 1024 * 1024;
+
+function readBodyLimited(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', c => {
+      size += c.length;
+      if (size > limit) {
+        const e = new Error('request body too large');
+        e.status = 413;
+        reject(e);
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function opencodeProxy(req, res, pathname) {
+  const prefix = '/api/llm/opencode/';
+  const rest = pathname.slice(prefix.length);
+  if (!OPENCODE_PATHS.has(rest)) return sendJson(res, 404, { error: { message: 'unknown upstream path' } });
+
+  // Same-origin only. A browser sends Origin on cross-origin requests; refusing
+  // another site's origin keeps this from becoming a free relay for its keys.
+  const origin = req.headers.origin;
+  if (origin && origin !== appOrigin(req)) return sendJson(res, 403, { error: { message: 'origin not allowed' } });
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'authorization, content-type' });
+    return res.end();
+  }
+  if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'method not allowed' } });
+
+  const auth = req.headers.authorization || '';
+  if (!/^Bearer\s+\S+/i.test(auth)) return sendJson(res, 401, { error: { message: 'OpenCode API key required' } });
+  if (Number(req.headers['content-length'] || 0) > MAX_LLM_BODY) return sendJson(res, 413, { error: { message: 'request body too large' } });
+
+  let body;
+  try { body = await readBodyLimited(req, MAX_LLM_BODY); }
+  catch (e) { return sendJson(res, e.status || 400, { error: { message: e.message } }); }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'Authorization': auth,
+    'User-Agent': 'MindSpark-selfhost/1.0'
+  };
+  // OpenCode Go asks clients for a stable session id. Forward one if a future
+  // client sends it; otherwise this stays absent rather than inventing a new
+  // "session" on every request.
+  const session = req.headers['x-opencode-session'];
+  if (session) headers['x-opencode-session'] = String(session);
+
+  let upstream;
+  try {
+    upstream = await fetch(OPENCODE_UPSTREAM + '/' + rest, {
+      method: 'POST',
+      headers,
+      body,
+      signal: AbortSignal.timeout(120000)
+    });
+  } catch (e) {
+    const timedOut = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    return sendJson(res, 502, { error: { message: timedOut ? 'OpenCode timed out' : 'OpenCode unreachable' } });
+  }
+
+  const text = await upstream.text();
+  const type = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
+  res.writeHead(upstream.status, {
+    'Content-Type': type,
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(text)
+  });
+  res.end(text);
+}
+
+// ---------------------------------------------------------------------------
 // OAuth callback. Mirrors worker/oauth-worker.js: exchange the code, then hand
 // the token to the opener window via postMessage. The token is never written
 // to disk or logged. ALLOWED_GITHUB_LOGINS is optional and checked server-side
@@ -293,7 +391,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/config.js') {
-      const cfg = { defaultRepo: DEFAULT_REPO, collab: false };
+      const cfg = {
+        defaultRepo: DEFAULT_REPO,
+        collab: false,
+        llmProxy: appOrigin(req) + '/api/llm/opencode'
+      };
       if (OAUTH_ENABLED) {
         const origin = appOrigin(req);
         cfg.oauth = { clientId: GITHUB_CLIENT_ID, workerUrl: origin, appOrigin: origin };
@@ -305,6 +407,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/callback') return oauthCallback(req, res, url);
+
+    if (p.startsWith('/api/llm/opencode/')) return opencodeProxy(req, res, p);
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return send(res, 405, 'Method not allowed', 'text/plain');
