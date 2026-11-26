@@ -29,6 +29,11 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Earlier revisions used Cloudflare's apt repository. Its key rotates, and a
+# stale source file makes every `apt-get update` fail before this script can
+# install anything. cloudflared now comes from Cloudflare's release .deb.
+rm -f /etc/apt/sources.list.d/cloudflared.list
+
 REPO_URL="${REPO_URL:-https://github.com/JamesRivers/MindSpark.git}"
 BRANCH="${BRANCH:-main}"
 SRC_DIR="${SRC_DIR:-}"
