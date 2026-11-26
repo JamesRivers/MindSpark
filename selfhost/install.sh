@@ -123,13 +123,22 @@ curl -fsS "http://127.0.0.1:$PORT/status" | jq . || true
 if [ "${SKIP_CLOUDFLARED:-0}" != "1" ]; then
   echo "==> Installing cloudflared"
   if ! command -v cloudflared >/dev/null 2>&1; then
-    install -d -m 0755 /usr/share/keyrings
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
-    echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
-      > /etc/apt/sources.list.d/cloudflared.list
-    apt-get update -y
-    apt-get install -y cloudflared
+    # The Cloudflare apt repository's signing key changes independently of this
+    # script; the release .deb is signed and versioned by Cloudflare and avoids
+    # relying on that key. arm64 and amd64 are both published.
+    arch="$(dpkg --print-architecture)"
+    case "$arch" in
+      amd64|arm64) ;;
+      *) echo "Unsupported architecture for cloudflared: $arch" >&2; exit 1 ;;
+    esac
+    curl -fsSL -o /tmp/cloudflared.deb \
+      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch.deb"
+    dpkg -i /tmp/cloudflared.deb
+    rm -f /tmp/cloudflared.deb
   fi
+  # Clean up a broken apt source from an earlier run, if any, so `apt update`
+  # is not left failing on an expired key.
+  rm -f /etc/apt/sources.list.d/cloudflared.list
 
   if [ -n "$TUNNEL_TOKEN" ]; then
     echo "==> Installing Cloudflare Tunnel service"
