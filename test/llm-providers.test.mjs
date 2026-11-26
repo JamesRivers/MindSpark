@@ -68,7 +68,7 @@ describe('built-in providers', () => {
   test('resolved providers carry the shape functions and any extra headers', () => {
     const { llmProviders } = harness();
     const P = llmProviders();
-    assert.deepEqual(Object.keys(P), ['anthropic', 'openai', 'openrouter', 'groq']);
+    assert.deepEqual(Object.keys(P), ['anthropic', 'openai', 'openrouter', 'groq', 'opencode', 'opencode-go']);
     assert.equal(P.openrouter.headers('k')['HTTP-Referer'], 'https://app.example');
     assert.equal(P.openrouter.headers('k').Authorization, 'Bearer k');
     for (const p of Object.values(P)) {
@@ -125,13 +125,24 @@ describe('custom providers', () => {
     }
   });
 
+  test('OpenCode Console and Go are OpenAI-compatible built-ins', () => {
+    const h = harness();
+    const p = h.llmProviders();
+    assert.equal(p.opencode.url, 'https://opencode.ai/inference/openai/v1/chat/completions');
+    assert.equal(p['opencode-go'].url, 'https://opencode.ai/inference/go/openai/v1/chat/completions');
+    assert.equal(p.opencode.shape, 'openai');
+    assert.equal(p['opencode-go'].shape, 'openai');
+    assert.equal(p.opencode.body, p.openai.body, 'shares the chat/completions wire shape');
+    assert.equal(p['opencode-go'].body, p.openai.body, 'shares the chat/completions wire shape');
+  });
+
   test('save round-trips through the validator; load survives junk in storage', () => {
     const h = harness();
     assert.equal(h.saveLlmProviders([{ id: 'mistral', label: 'Mistral', url: 'https://api.mistral.ai/v1/chat/completions', shape: 'openai', defaultModel: 'mistral-large-latest' }, { id: 'nope' }]), true);
     assert.deepEqual(JSON.parse(h.store['mindspark:llm:providers']), [{ id: 'mistral', label: 'Mistral', url: 'https://api.mistral.ai/v1/chat/completions', shape: 'openai', defaultModel: 'mistral-large-latest', needsKey: true }]);
     h.store['mindspark:llm:providers'] = '{broken';
     assert.deepEqual(h.loadLlmProviders(), []);
-    assert.deepEqual(Object.keys(h.llmProviders()), ['anthropic', 'openai', 'openrouter', 'groq'], 'built-ins are unaffected by junk');
+    assert.deepEqual(Object.keys(h.llmProviders()), ['anthropic', 'openai', 'openrouter', 'groq', 'opencode', 'opencode-go'], 'built-ins are unaffected by junk');
   });
 });
 

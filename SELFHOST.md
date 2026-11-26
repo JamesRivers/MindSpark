@@ -120,10 +120,26 @@ unlisted-but-authorized account still cannot read or write a private maps repo.
 
 The **✦** button beside **＋** opens *Create a mind map with AI*:
 
-- pick a provider (Anthropic, OpenAI, OpenRouter, Groq, or a custom
-  OpenAI-compatible endpoint added in Preferences)
+- pick a provider (Anthropic, OpenAI, OpenRouter, Groq, **OpenCode Console**,
+  **OpenCode Go**, or a custom OpenAI-compatible endpoint added in
+  Preferences)
 - paste your own API key
 - describe the topic
+
+### OpenCode
+
+Both OpenCode endpoints are built in:
+
+| Provider | Endpoint | Use it with |
+|---|---|---|
+| OpenCode (Console) | `https://opencode.ai/inference/openai/v1/chat/completions` | Pay-as-you-go Console credits |
+| OpenCode Go | `https://opencode.ai/inference/go/openai/v1/chat/completions` | A Go / Go Plus subscription |
+
+Create a personal API key at <https://opencode.ai/console> → **Account →
+Personal API keys** (format `oc_sk_...`), then paste it into the ✦ panel and
+type the model id (for example `glm-5.3`, `kimi-k3`, `claude-sonnet-5-5`).
+Free-tier models are only available inside OpenCode itself; use paid credits or
+Go from another client such as MindSpark.
 
 The key is stored in that browser's `localStorage` under
 `mindspark:llm:key:<provider>` and sent **directly to the provider** — never to

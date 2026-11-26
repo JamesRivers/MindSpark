@@ -8896,6 +8896,13 @@ const LLM_BUILTIN = [
   { id:'openrouter', label:'OpenRouter (free models)', shape:'openai',    url:'https://openrouter.ai/api/v1/chat/completions', defaultModel:'google/gemma-3-27b-it:free',
     extraHeaders:()=>({'HTTP-Referer':location.origin,'X-Title':'MindSpark'}) },
   { id:'groq',       label:'Groq (fast, free)',        shape:'openai',    url:'https://api.groq.com/openai/v1/chat/completions', defaultModel:'llama-3.3-70b-versatile' },
+  // OpenCode Console (pay-as-you-go) and OpenCode Go. Both expose an
+  // OpenAI-compatible chat-completions face over the same model gateway, so the
+  // existing 'openai' shape works unchanged. Console translates every text
+  // model (Claude, GPT, Gemini, open models) to this endpoint; use the Go URL
+  // when the key belongs to a Go subscription. Key format: oc_sk_...
+  { id:'opencode',    label:'OpenCode (Console)',       shape:'openai',    url:'https://opencode.ai/inference/openai/v1/chat/completions',      defaultModel:'glm-5.3' },
+  { id:'opencode-go', label:'OpenCode Go',              shape:'openai',    url:'https://opencode.ai/inference/go/openai/v1/chat/completions',  defaultModel:'glm-5.3' },
 ];
 const LLM_PROVIDERS_KEY = 'mindspark:llm:providers';
 const LLM_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
