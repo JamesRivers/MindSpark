@@ -10,6 +10,14 @@
    `initStore()` probes /healthz, then picks one.
    ============================================================ */
 
+/* Deployment configuration.
+   A self-hosted server (see selfhost/server.js) injects /config.js before this
+   file and uses it to point the app at its own GitHub OAuth callback and shared
+   maps repository, without forking the client. Static deployments have no
+   config.js, so window.MINDSPARK_CONFIG is absent and the shipped defaults
+   below apply. The guards are deliberately local to each use: tests lift
+   individual declarations out of this file and evaluate them without a window. */
+
 /* ------------------------------------------------------------
    On `catch(e){}` in this file.
 
@@ -428,7 +436,10 @@ function cspAllowsInstance(instance){
 // sign-in if the token can), `group/sub/name` names a shared project verbatim
 // and must already exist. A deployment for a team sets its shared project here
 // so nobody has to type it.
-const DEFAULT_REPO = 'mindspark-maps';
+const DEFAULT_REPO = (typeof window !== 'undefined' && window.MINDSPARK_CONFIG
+  && typeof window.MINDSPARK_CONFIG.defaultRepo === 'string' && window.MINDSPARK_CONFIG.defaultRepo.trim())
+  ? window.MINDSPARK_CONFIG.defaultRepo.trim()
+  : 'mindspark-maps';
 // How stale a map's "last updated" stamp in _index.json may get before an
 // autosave refreshes it (it only orders the sidebar on other devices).
 const INDEX_STAMP_MS = 10*60*1000;
@@ -9221,6 +9232,153 @@ function showBuildPrompt(nodeId){
     } finally { send.disabled=false; }
   };
 }
+// ============================================================
+// Create a whole map from a prompt, using the same BYOK settings as
+// "Build prompt -> Run with API".
+//
+// The AI element in MindSpark was a branch-level prompt runner; this puts it
+// at map level. It deliberately asks for a Markdown outline rather than JSON:
+// the app already parses Markdown into real structure (headings, nesting,
+// inline formatting) for imports and for "Add as child nodes", so the answer
+// lands on the canvas through a path that is already tested, instead of a
+// second bespoke format that could drift.
+//
+// Keys use the exact same localStorage slots as the branch runner
+// (mindspark:llm:key:<provider>), so entering one here also configures the
+// existing AI panel, and vice versa. Nothing is sent anywhere except straight
+// from this browser to the provider the user chose.
+// ============================================================
+function showAiMapPanel(){
+  document.querySelectorAll('.bp-panel,.export-pop').forEach(p=>p.remove());
+  const PROVS=llmProviders();
+  let provider=localStorage.getItem('mindspark:llm:provider')||'anthropic';
+  if(!PROVS[provider]) provider='anthropic';
+  const model=llmModelFor(provider);
+  const panel=document.createElement('div');
+  panel.className='bp-panel';
+  panel.tabIndex=-1;
+  panel.setAttribute('role','dialog');
+  panel.setAttribute('aria-label','Create a mind map with AI');
+  const _prevFocus=document.activeElement;
+  panel.innerHTML=`
+    <div class="bp-head"><b>✦ Create a mind map with AI</b><button class="bp-x" title="Close">×</button></div>
+    <textarea class="bp-text" spellcheck="true" aria-label="What should the map be about?" placeholder="Describe the topic, question or notes you want mapped.&#10;&#10;Example: A study map for the OSI model, one branch per layer, with the protocols and a memory hook under each."></textarea>
+    <div class="bp-run">
+      <div class="bp-run-row">
+        <select class="bp-provider" aria-label="LLM provider">
+          ${Object.entries(PROVS).map(([k,v])=>`<option value="${escapeHtml(k)}"${k===provider?' selected':''}>${escapeHtml(v.label)}</option>`).join('')}
+        </select>
+        <input class="bp-model" placeholder="model" aria-label="Model name" value="${escapeHtml(model)}">
+      </div>
+      <input class="bp-key" type="password" placeholder="API key (stored only in this browser)" aria-label="API key" value="${escapeHtml(localStorage.getItem('mindspark:llm:key:'+provider)||'')}">
+      <div class="bp-warn">✦ BYOK: your key stays in this browser and is sent directly to the provider you pick. Use a scoped key; don't do this on a shared machine. The map itself is saved to your GitHub maps repository.</div>
+      <div class="bp-run-row">
+        <button class="bp-send primary">Generate map →</button>
+        <button class="bp-forget" title="Remove this provider's key from this browser">Forget key</button>
+      </div>
+      <div class="bp-result" style="display:none"></div>
+    </div>`;
+  document.body.appendChild(panel);
+  panel.addEventListener('mousedown',e=>e.stopPropagation());
+  const $$=s=>panel.querySelector(s);
+  const ta=$$('.bp-text'), provSel=$$('.bp-provider'), modelIn=$$('.bp-model'), keyIn=$$('.bp-key');
+  const closePanel=()=>{ panel.remove();
+    if(_prevFocus && _prevFocus.focus && document.contains(_prevFocus)) _prevFocus.focus(); };
+  $$('.bp-x').onclick=closePanel;
+  panel.addEventListener('keydown',e=>{
+    if(isComposingKey(e)) return;
+    if(e.key==='Escape'){ e.preventDefault(); e.stopPropagation(); closePanel(); }
+  });
+  panel.focus();
+
+  const keyHint=()=>{ const cfg=llmProviders()[provSel.value]; keyIn.placeholder=(cfg && !cfg.needsKey) ? 'No key needed for this provider (optional)' : 'API key (stored only in this browser)'; };
+  provSel.onchange=()=>{ const pv=provSel.value;
+    modelIn.value=llmModelFor(pv);
+    keyIn.value=localStorage.getItem('mindspark:llm:key:'+pv)||''; keyHint(); };
+  keyHint();
+  $$('.bp-forget').onclick=()=>{ const pv=provSel.value;
+    localStorage.removeItem('mindspark:llm:key:'+pv); keyIn.value='';
+    toast('Key for '+((llmProviders()[pv]||{}).label||pv)+' removed from this browser'); };
+
+  $$('.bp-send').onclick=async()=>{
+    const topic=ta.value.trim();
+    if(!topic){ toast('Describe what the map should be about'); ta.focus(); return; }
+    const cfg=llmProviders()[provSel.value];
+    if(!cfg){ toast('That provider is no longer configured'); return; }
+    const pv=cfg.id, key=keyIn.value.trim(), mdl=modelIn.value.trim()||cfg.defaultModel;
+    if(cfg.needsKey && !key){ toast('Enter an API key'); keyIn.focus(); return; }
+    if(!mdl){ toast('Enter a model name'); modelIn.focus(); return; }
+    if(cfg.custom && !cspAllowsInstance(cfg.url)){
+      const origin=new URL(cfg.url).origin, res=$$('.bp-result');
+      res.style.display='block';
+      res.textContent='This deployment\u2019s Content-Security-Policy does not allow '+origin+'. Add it to connect-src in public/index.html, public/_headers and server.js (or set EXTRA_CONNECT_SRC when self-hosting), then redeploy.';
+      return;
+    }
+    try{
+      localStorage.setItem('mindspark:llm:provider',pv);
+      localStorage.setItem('mindspark:llm:model:'+pv,mdl);
+      if(key) localStorage.setItem('mindspark:llm:key:'+pv,key); else localStorage.removeItem('mindspark:llm:key:'+pv);
+    }catch(e){ console.warn('LLM settings not remembered (storage blocked or full):', e.message); }
+
+    const prompt=
+      'You are generating a mind map. Topic / request:\n' + topic + '\n\n'
+      + 'Return ONLY a Markdown outline. Do not add a title heading, preamble, explanation, or code fences. '
+      + 'Start directly with 4-7 top-level "- " branches. Give each branch 2-4 nested "  - " sub-points. '
+      + 'Keep node text short (under 12 words), specific, and useful. Where it helps, add a third level of indented bullets.';
+
+    const res=$$('.bp-result'); res.style.display='block'; res.textContent='Generating…';
+    const send=$$('.bp-send'); send.disabled=true;
+    try{
+      const r=await fetch(cfg.url,{method:'POST',headers:cfg.headers(key),body:cfg.body(mdl,prompt)});
+      if(!r.ok){ const t=await r.text(); throw new Error('HTTP '+r.status+' - '+t.slice(0,200)); }
+      const data=await r.json();
+      let answer=cfg.extract(data)||'';
+      if(!answer.trim()) throw new Error('The provider returned an empty answer');
+      // Some models wrap the outline in a fenced block despite being told not
+      // to. Strip one outer fence rather than teaching the parser about fences.
+      const fence=answer.match(/^\s*```[a-zA-Z]*\s*\n([\s\S]*?)\n```\s*$/);
+      if(fence) answer=fence[1];
+      const added=buildMapFromAi(topic, answer);
+      if(!added){ throw new Error('The answer did not contain a usable outline - try a more specific prompt'); }
+      closePanel();
+      toast('Created a map with '+added+' topics');
+    }catch(e){
+      res.textContent='Error: '+e.message;
+    } finally { send.disabled=false; }
+  };
+  ta.focus();
+}
+
+// Build a fresh map whose root is the prompt and whose branches are the parsed
+// outline. Mirrors createMapFromTemplate()'s hand-off (flush, leave previous
+// map, history, tabs) so generating a map is not a lossy special case.
+function buildMapFromAi(topic, outline){
+  if(!leaveLiveForSwitch()) return 0;
+  endHistoryPreview(false);
+  exitSharedMode();
+  flushPendingSave();
+  const id=uid(), rid=uid();
+  const rootText=topic.length>80 ? topic.slice(0,77)+'…' : topic;
+  const m={id,title:rootText,titleAuto:false,color:PALETTE[Math.floor(Math.random()*PALETTE.length)],rootId:rid,
+    nodes:{[rid]:{id:rid,text:rootText,parent:null,x:0,y:0,side:'root',color:'#fff'}}};
+  const prev={map,sel,history,hpos};
+  map=m; sel=rid; history=[]; hpos=-1;
+  const added=addResponseAsNodes(rid, outline) || 0;
+  if(!added){ ({map,sel,history,hpos}=prev); return 0; }
+  balanceRootSides();
+  autoLayout();
+  $('#mapTitle').value=map.title;
+  if(tabsEnabled){ openMapInTab(map); scheduleSave(); return added; }
+  view.k=1;
+  const {w:sw,h:sh}=_stageSize();
+  const rn=map.nodes[rid];
+  view.x = sw/2 - (rn.x + (rn.w||120)/2);
+  view.y = sh/2 - (rn.y + (rn.h||50)/2);
+  applyView(); _markStage();
+  scheduleSave(); refreshList();
+  return added;
+}
+
 // Turn an LLM answer into a subtree under `parentId`. Answers come back as
 // Markdown far more often than not - headings, nested bullets, numbered steps,
 // **bold** and `code`, the odd table or fenced block - so the text goes through
@@ -12868,6 +13026,7 @@ let toastT;function toast(msg){const t=$('#toast');t.textContent=msg;t.classList
    WIRE UP
    ============================================================ */
 $('#newMap').onclick=createMap;
+$('#aiMap').onclick=showAiMapPanel;
 $('#emptyNew').onclick=createMap;
 $('#addChild').onclick=()=>{ if(!map)return; addNode(sel||map.rootId,false); };
 // Before printing, fit the whole map into view so nothing is clipped on paper.
@@ -17262,11 +17421,11 @@ function hideUserPill(){ const pill=$('#userPill'); if(pill) pill.style.display=
 // worker, which then delivered it to an origin the opener was not - so the
 // browser dropped it and the overlay just sat there (issue #43).
 // ============================================================
-const GH_OAUTH = {
+const GH_OAUTH = Object.assign({
   clientId: 'Ov23liCukvrI3Zs9p3Px',
   workerUrl: 'https://mindspark-oauth.githubpage.workers.dev/',
   appOrigin: 'https://mindspark.githubpage.workers.dev'
-};
+}, (typeof window !== 'undefined' && window.MINDSPARK_CONFIG && window.MINDSPARK_CONFIG.oauth) || {});
 function oauthConfigured(){
   if(/(^|\.)github\.io$/.test(location.hostname)) return false;
   if(!(GH_OAUTH.clientId && GH_OAUTH.workerUrl && GH_OAUTH.appOrigin)) return false;
@@ -17320,7 +17479,10 @@ function collabBase(){
 // backend is the companion on this origin, or the Cloudflare worker whose
 // CORS/origin is bound to the deployed app - so, as before, neither works from
 // local server-mode hosting or from static PAT-only hosting with no worker.
-function collabAvailable(){ return MODE==='cloud' && !!collabBase(); }
+function collabAvailable(){
+  const cfg = (typeof window !== 'undefined' && window.MINDSPARK_CONFIG) || {};
+  return MODE==='cloud' && cfg.collab !== false && !!collabBase();
+}
 // Named collaborators and link permissions need a VERIFIED identity, minted by
 // the backend from the forge token (/api/session). Which forges a backend can
 // vouch for is its business - the worker verifies GitHub tokens, a companion

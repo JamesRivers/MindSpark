@@ -272,6 +272,11 @@ A backend that wants to be discovered implements the worker's client contract:
 
 ### Self-hosted (VPS / Docker)
 
+> **VM + GitHub storage + OAuth + Cloudflare Tunnel:** see
+> [SELFHOST.md](SELFHOST.md) for a stateless deployment that keeps maps in a
+> GitHub repository instead of SQLite, signs in with GitHub OAuth, and includes
+> in-app BYOK AI map generation. `./selfhost/install.sh` sets up the VM.
+
 ```bash
 git clone <your-repo> mindspark && cd mindspark
 PORT=80 node server.js        # put nginx/Caddy in front for TLS
